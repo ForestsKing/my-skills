@@ -1,0 +1,12 @@
+{
+  "base_name": "arXiv 每日论文",
+  "table_name": "论文清单",
+  "search": {
+    "field": "title",
+    "keywords": ["time series", "time-series"],
+    "match": "any",
+    "categories": [],
+    "include_cross_list": true
+  },
+  "retention_days": 30
+}
