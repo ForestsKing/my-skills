@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from common import SkillError, canonical_abs_url, load_config, load_json, prune_manifest_file, save_json
+from common import SkillError, canonical_abs_url, load_config, load_json, parse_iso_date, prune_manifest_file, save_json
 
 ATOM = "http://www.w3.org/2005/Atom"
 OPENSEARCH = "http://a9.com/-/spec/opensearch/1.1/"
@@ -194,8 +194,9 @@ class ArxivClient:
                 self.sleeper(interval)
         raise SkillError("arXiv 请求重试耗尽")
 
-    def fetch_newest_unseen_day(self, existing_links: set[str]) -> dict[str, Any]:
+    def fetch_latest_day(self, existing_links: set[str], latest_date: str = "") -> dict[str, Any]:
         query = build_search_query(self.config)
+        latest_archived = parse_iso_date(latest_date) if latest_date else None
         page_size = int(self.config.get("page_size", 200))
         cap = int(self.config.get("max_accessible_results", 30000))
         start = 0
@@ -203,6 +204,20 @@ class ArxivClient:
         selected: dict[str, dict[str, Any]] = {}
         observed: set[str] = set()
         total_results = None
+
+        def result() -> dict[str, Any]:
+            papers = sorted(selected.values(), key=lambda item: (item["updated"], item["canonical_id"]), reverse=True)
+            return {
+                "status": "ok" if papers else "no_new_papers",
+                "date_semantics": "submitted_date_from_atom_updated_utc",
+                "submitted_date": submitted_date,
+                "filter_summary": query,
+                "query": query,
+                "total_results": total_results or 0,
+                "papers": papers,
+                "stats": {"discovered_count": len(papers), "written_count": 0, "failure_count": 0},
+            }
+
         while True:
             if start >= cap:
                 raise SkillError("为证明目标日期完整性需要访问超过 30,000 条结果，请缩小筛选条件")
@@ -225,32 +240,22 @@ class ArxivClient:
                     break
                 if not paper_matches_category_mode(paper, self.config):
                     continue
+                if not submitted_date:
+                    submitted_date = day
+                    if latest_archived and parse_iso_date(day) <= latest_archived:
+                        return result()
                 canonical = paper["canonical_id"]
                 if canonical in observed:
                     continue
                 observed.add(canonical)
-                if paper["abs_url"] in existing_links:
-                    continue
-                if not submitted_date:
-                    submitted_date = day
-                if day == submitted_date:
+                if day == submitted_date and paper["abs_url"] not in existing_links:
                     selected[canonical] = paper
             if stop_after_page:
                 break
             start += len(page.entries)
             if start >= page.total_results or len(page.entries) < page_size:
                 break
-        papers = sorted(selected.values(), key=lambda item: (item["updated"], item["canonical_id"]), reverse=True)
-        return {
-            "status": "ok" if papers else "no_new_papers",
-            "date_semantics": "submitted_date_from_atom_updated_utc",
-            "submitted_date": submitted_date,
-            "filter_summary": query,
-            "query": query,
-            "total_results": total_results or 0,
-            "papers": papers,
-            "stats": {"discovered_count": len(papers), "written_count": 0, "failure_count": 0},
-        }
+        return result()
 
 
 def normalize_existing_links(items: list[Any]) -> set[str]:
@@ -265,20 +270,41 @@ def normalize_existing_links(items: list[Any]) -> set[str]:
     return links
 
 
+def normalize_archive_state(data: Any) -> tuple[set[str], str]:
+    if not isinstance(data, dict):
+        raise SkillError("归档状态必须是 JSON 对象")
+    record_count = data.get("record_count")
+    if isinstance(record_count, bool) or not isinstance(record_count, int) or record_count < 0:
+        raise SkillError("归档状态 record_count 无效")
+    latest_date = data.get("latest_date", "")
+    if not isinstance(latest_date, str):
+        raise SkillError("归档状态 latest_date 无效")
+    latest_date = latest_date.strip()
+    if record_count == 0 and latest_date:
+        raise SkillError("空表归档状态不应包含 latest_date")
+    if record_count > 0 and not latest_date:
+        raise SkillError("非空表归档状态缺少 latest_date")
+    if latest_date:
+        latest_date = parse_iso_date(latest_date).isoformat()
+    links = data.get("links", [])
+    if not isinstance(links, list):
+        raise SkillError("归档状态 links 必须是数组")
+    return normalize_existing_links(links), latest_date
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Fetch the newest unseen arXiv submitted_date")
+    parser = argparse.ArgumentParser(description="Fetch the latest arXiv submitted_date after the archive boundary")
     subparsers = parser.add_subparsers(dest="command", required=True)
     fetch = subparsers.add_parser("fetch")
     fetch.add_argument("--config", required=True)
-    fetch.add_argument("--existing-links", required=True)
+    fetch.add_argument("--archive-state", required=True)
     fetch.add_argument("--output", required=True)
     fetch.add_argument("--manifest")
     args = parser.parse_args()
     try:
         config = load_config(args.config)
-        existing_data = load_json(args.existing_links)
-        existing_links = normalize_existing_links(existing_data.get("links", []))
-        state = ArxivClient(config["arxiv"]).fetch_newest_unseen_day(existing_links)
+        existing_links, latest_date = normalize_archive_state(load_json(args.archive_state))
+        state = ArxivClient(config["arxiv"]).fetch_latest_day(existing_links, latest_date)
         if state.get("submitted_date") and args.manifest:
             prune_manifest_file(args.manifest, state["submitted_date"], config["retention_days"])
         save_json(args.output, state)

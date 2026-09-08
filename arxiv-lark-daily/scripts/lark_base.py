@@ -6,6 +6,7 @@ import copy
 import json
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -480,20 +481,56 @@ def cell_text(value: Any) -> str:
     return ""
 
 
-def record_link(record: dict[str, Any], base_state: dict[str, Any] | None = None) -> str:
+def record_field(record: dict[str, Any], base_state: dict[str, Any], name: str) -> Any:
     fields = record.get("fields") if isinstance(record.get("fields"), dict) else record
     if not isinstance(fields, dict):
-        return ""
-    candidates = ["链接"]
-    if base_state:
-        link_id = base_state.get("field_ids", {}).get("链接") if isinstance(base_state.get("field_ids"), dict) else ""
-        if link_id:
-            candidates.append(link_id)
+        return None
+    candidates = [name]
+    field_ids = base_state.get("field_ids")
+    if isinstance(field_ids, dict) and field_ids.get(name):
+        candidates.append(field_ids[name])
     for key in candidates:
-        text = cell_text(fields.get(key))
-        if text:
-            return text
+        if key in fields:
+            return fields[key]
+    return None
+
+
+def record_link(record: dict[str, Any], base_state: dict[str, Any] | None = None) -> str:
+    if not base_state:
+        fields = record.get("fields") if isinstance(record.get("fields"), dict) else record
+        return cell_text(fields.get("链接")) if isinstance(fields, dict) else ""
+    return cell_text(record_field(record, base_state, "链接"))
+
+
+def normalize_date_cell(value: Any) -> str:
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        seconds = float(value) / 1000 if abs(float(value)) >= 100_000_000_000 else float(value)
+        try:
+            return datetime.fromtimestamp(seconds, tz=timezone.utc).date().isoformat()
+        except (OverflowError, OSError, ValueError) as exc:
+            raise SkillError(f"日期格式无效: {value}") from exc
+    if isinstance(value, str):
+        text = value.strip()
+        return parse_iso_date(text).isoformat() if text else ""
+    if isinstance(value, dict):
+        for key in ("date", "datetime", "timestamp", "value", "text"):
+            if key in value:
+                date_value = normalize_date_cell(value[key])
+                if date_value:
+                    return date_value
+        return ""
+    if isinstance(value, list):
+        for item in value:
+            date_value = normalize_date_cell(item)
+            if date_value:
+                return date_value
     return ""
+
+
+def record_date(record: dict[str, Any], base_state: dict[str, Any]) -> str:
+    return normalize_date_cell(record_field(record, base_state, "日期"))
 
 
 def pagination_value(payload: Any, keys: tuple[str, ...], default: Any = None) -> Any:
@@ -505,30 +542,32 @@ def pagination_value(payload: Any, keys: tuple[str, ...], default: Any = None) -
     return default
 
 
-def list_link_records(config: dict[str, Any], base_state: dict[str, Any]) -> list[tuple[str, str]]:
-    result: list[tuple[str, str]] = []
+def list_records(config: dict[str, Any], base_state: dict[str, Any], field_names: tuple[str, ...]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
     offset = 0
     seen_records = set()
     while True:
-        payload = cli(
+        command = [
             "base", "+record-list",
             "--base-token", base_state["base_token"],
             "--table-id", base_state["table_id"],
-            "--field-id", base_state["field_ids"].get("链接", "链接"),
+        ]
+        for name in field_names:
+            command.extend(("--field-id", base_state["field_ids"].get(name, name)))
+        command.extend((
             "--offset", str(offset),
             "--limit", "200",
             "--format", "json",
             "--as", config["destination"]["identity"],
-        )
+        ))
+        payload = cli(*command)
         records = extract_records(payload)
         for record in records:
             record_id = record["record_id"]
             if record_id in seen_records:
                 continue
             seen_records.add(record_id)
-            link = record_link(record, base_state)
-            if link:
-                result.append((record_id, link))
+            result.append(record)
         has_more = bool(pagination_value(payload, ("has_more",), False))
         if not has_more or not records:
             break
@@ -537,14 +576,31 @@ def list_link_records(config: dict[str, Any], base_state: dict[str, Any]) -> lis
     return result
 
 
-def export_links(config: dict[str, Any], base_state: dict[str, Any]) -> dict[str, Any]:
+def list_link_records(config: dict[str, Any], base_state: dict[str, Any]) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    for record in list_records(config, base_state, ("链接",)):
+        link = record_link(record, base_state)
+        if link:
+            result.append((record["record_id"], link))
+    return result
+
+
+def export_state(config: dict[str, Any], base_state: dict[str, Any]) -> dict[str, Any]:
+    records = list_records(config, base_state, ("日期", "链接"))
     links = set()
-    for _, link in list_link_records(config, base_state):
-        try:
-            links.add(canonical_abs_url(link))
-        except SkillError:
-            continue
-    return {"links": sorted(links), "record_count": len(links)}
+    latest_date = ""
+    for record in records:
+        submitted_date = record_date(record, base_state)
+        if not submitted_date:
+            raise SkillError(f"飞书记录缺少有效日期: {record['record_id']}")
+        latest_date = max(latest_date, submitted_date)
+        link = record_link(record, base_state)
+        if link:
+            try:
+                links.add(canonical_abs_url(link))
+            except SkillError:
+                continue
+    return {"record_count": len(records), "latest_date": latest_date, "links": sorted(links)}
 
 
 def find_existing_record(config: dict[str, Any], base_state: dict[str, Any], link: str) -> str:
@@ -687,7 +743,7 @@ def main() -> int:
     prepare_parser = subparsers.add_parser("prepare")
     prepare_parser.add_argument("--config", required=True)
     prepare_parser.add_argument("--output", required=True)
-    export_parser = subparsers.add_parser("export-links")
+    export_parser = subparsers.add_parser("export-state")
     export_parser.add_argument("--config", required=True)
     export_parser.add_argument("--base-state", required=True)
     export_parser.add_argument("--output", required=True)
@@ -703,10 +759,16 @@ def main() -> int:
             state = prepare(config)
             save_json(args.output, state)
             result = {"ok": True, "output": args.output, "base_name": state["base_name"], "table_name": state["table_name"], "base_url": state["base_url"], "tag_options": state.get("tag_options", [])}
-        elif args.command == "export-links":
-            links = export_links(config, load_json(args.base_state))
-            save_json(args.output, links)
-            result = {"ok": True, "output": args.output, "link_count": len(links["links"])}
+        elif args.command == "export-state":
+            state = export_state(config, load_json(args.base_state))
+            save_json(args.output, state)
+            result = {
+                "ok": True,
+                "output": args.output,
+                "record_count": state["record_count"],
+                "latest_date": state["latest_date"],
+                "link_count": len(state["links"]),
+            }
         else:
             state = write_papers(config, load_json(args.base_state), load_json(args.papers), Path(args.manifest))
             save_json(args.papers, state)

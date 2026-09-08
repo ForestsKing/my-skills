@@ -1,6 +1,6 @@
 ---
 name: arxiv-lark-daily
-description: 每日检索指定主题的最新 arXiv 论文，按 submitted_date 找出飞书多维表格尚未归档的整日论文，忠实翻译摘要，生成中文技术标签，写入飞书多维表格，并输出包含日期、数量、表格链接、今日要点和具体阅读建议的中文日报。用户提到 arXiv 日报、论文监控、主题论文订阅、同步论文到飞书多维表格或补跑论文归档时应使用本 skill，即使用户没有明确说出 skill 名称。
+description: 每日检索指定主题的最新 arXiv 论文，仅在 arXiv 最近 submitted_date 严格晚于飞书多维表格最新日期时归档该整日论文；表为空时直接归档 arXiv 最近一天。忠实翻译摘要，生成中文技术标签，写入飞书多维表格，并输出包含日期、数量、表格链接、今日要点和具体阅读建议的中文日报。用户提到 arXiv 日报、论文监控、主题论文订阅、同步论文到飞书多维表格或补跑论文归档时应使用本 skill，即使用户没有明确说出 skill 名称。
 ---
 
 # arXiv 每日论文归档
@@ -49,30 +49,30 @@ python "$SKILL_DIR/scripts/lark_base.py" prepare \
 
 脚本按配置精确匹配 Base 和数据表，创建或复用资源，验收固定五列 schema，并把字段 ID、Base URL、View ID 和已有标签选项写入 `.arxiv-lark-daily/base.json`。具体字段契约和安全修订规则以 `references/lark-base-contract.md` 为准。
 
-### 2. 导出已有论文链接
+### 2. 导出表格归档状态
 
 ```bash
-python "$SKILL_DIR/scripts/lark_base.py" export-links \
+python "$SKILL_DIR/scripts/lark_base.py" export-state \
   --config "$SKILL_DIR/config/default.json" \
   --base-state .arxiv-lark-daily/base.json \
-  --output .arxiv-lark-daily/existing-links.json
+  --output .arxiv-lark-daily/archive-state.json
 ```
 
-去重键是规范化 arXiv abs URL，不使用标题去重。链接单元格兼容原始 URL 和 Markdown 链接形式；细节以 `references/lark-base-contract.md` 为准。
+脚本读取整表的“日期”和“链接”列，输出实际记录数、最新有效日期和规范化 arXiv abs URL 集合。实际记录数用于判断表是否为空，最新日期用于确定归档边界，链接只用于目标日内去重。非空表存在空日期或无效日期时停止。细节以 `references/lark-base-contract.md` 为准。
 
-### 3. 获取最新未归档 submitted_date 的全部论文
+### 3. 获取严格晚于归档边界的 arXiv 最近一天
 
 ```bash
 python "$SKILL_DIR/scripts/arxiv_client.py" fetch \
   --config "$SKILL_DIR/config/default.json" \
-  --existing-links .arxiv-lark-daily/existing-links.json \
+  --archive-state .arxiv-lark-daily/archive-state.json \
   --manifest .arxiv-lark-daily/write-manifest.json \
   --output .arxiv-lark-daily/papers.json
 ```
 
-脚本使用 Atom `<updated>` 的 UTC 日期作为 `submitted_date`，从新到旧找出第一天尚未完整归档的论文，并收集该日期下所有满足筛选条件且尚未归档的论文。日期口径、分页校验和查询限制以 `references/arxiv-query-contract.md` 为准。
+脚本使用 Atom `<updated>` 的 UTC 日期作为 `submitted_date`，并以通过完整筛选的第一篇论文确定 arXiv 最近一天。表为空时收集该日全部论文；表非空时，仅当该日严格晚于表格最新日期才收集。链接去重只作用于这个目标日，不得转向相同或更早日期查找论文。日期口径、分页校验和查询限制以 `references/arxiv-query-contract.md` 为准。
 
-如果脚本输出无新论文消息，停止后续步骤；不要翻译、写表或生成日报。本地 manifest 的保留期清理由脚本按 `retention_days` 执行，只影响本地恢复状态，不删除飞书多维表格历史记录。
+如果 arXiv 没有匹配论文、最近一天没有严格晚于表格最新日期，或目标日去重后没有论文，脚本输出无新论文消息。此时停止后续步骤，不要翻译、写表或生成日报。本地 manifest 的保留期清理由脚本按 `retention_days` 执行，只影响本地恢复状态，不删除飞书多维表格历史记录。
 
 ### 4. 生成摘要翻译和标签
 
@@ -132,7 +132,7 @@ python "$SKILL_DIR/scripts/render_summary.py" \
 - 空表 schema 修订或修订后验收失败；
 - 配置中的检索字段、关键词、匹配方式、分类格式或保留期无效；
 - arXiv 返回错误、分页不一致或查询范围无法完整读取；
-- 无未归档论文时正常停止，并只输出固定无新论文消息；
+- arXiv 没有严格晚于表格最新日期的目标日时正常停止，并只输出固定无新论文消息；
 - 任一待写论文缺少忠实中文摘要；
 - 任一待写论文标签不合法；
 - 标签选项更新后读回确认失败；

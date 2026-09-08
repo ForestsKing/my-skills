@@ -53,9 +53,21 @@ lark-cli base +record-list \
 
 写入记录前，脚本重新读取“标签”字段完整定义，按精确名称找出缺失标签，保留已有选项顺序和元数据，将缺失标签追加到末尾，执行完整字段更新，然后读回确认所有标签均存在。同一次运行只集中更新一次标签字段。
 
-## 去重
+## 归档状态与去重
 
-使用规范化 abs URL 作为业务唯一键。读取“链接”列时必须处理分页，并同时支持以下单元格值：
+`export-state` 对“日期”和“链接”列执行一次完整分页读取，并输出：
+
+```json
+{
+  "record_count": 12,
+  "latest_date": "2026-09-04",
+  "links": ["https://arxiv.org/abs/2609.01234"]
+}
+```
+
+`record_count` 是实际读取到的记录数，不以有效链接数代替。空表输出 `record_count=0` 和空 `latest_date`。非空表的每条记录都必须包含可解析日期；脚本将日期规范化为 `YYYY-MM-DD` 并取最大值，缺少日期或日期无效时停止。
+
+链接集合只用于目标日内去重。使用规范化 abs URL 作为业务唯一键，读取“链接”列时同时支持以下单元格值：
 
 ```text
 https://arxiv.org/abs/2609.01234
@@ -72,8 +84,8 @@ https://arxiv.org/abs/2609.01234
 
 ```json
 {
-  "fields": ["链接"],
-  "data": [["[链接](https://arxiv.org/abs/2609.01234)"]],
+  "fields": ["日期", "链接"],
+  "data": [["2026-09-04T00:00:00Z", "[链接](https://arxiv.org/abs/2609.01234)"]],
   "record_id_list": ["recxxx"]
 }
 ```
@@ -82,13 +94,16 @@ https://arxiv.org/abs/2609.01234
 
 ```json
 {
-  "fields": [{"name": "链接", "field_id": "fldxxx"}],
-  "rows": [["[链接](https://arxiv.org/abs/2609.01234)"]],
+  "fields": [
+    {"name": "日期", "field_id": "fldDate"},
+    {"name": "链接", "field_id": "fldLink"}
+  ],
+  "rows": [["2026-09-04T00:00:00Z", "[链接](https://arxiv.org/abs/2609.01234)"]],
   "record_ids": ["recxxx"]
 }
 ```
 
-如果记录 ID 作为行内列返回，字段名可能是 `record_id`、`recordId`、`id` 或 `记录ID`。链接字段读取同时接受字段名 `链接` 和 `base.json` 中记录的链接字段 ID。
+如果记录 ID 作为行内列返回，字段名可能是 `record_id`、`recordId`、`id` 或 `记录ID`。“日期”和“链接”字段读取同时接受字段名以及 `base.json` 中对应的字段 ID。
 
 ## 写入载荷
 

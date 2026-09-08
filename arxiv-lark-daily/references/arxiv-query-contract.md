@@ -10,11 +10,19 @@
 
 按 `lastUpdatedDate` 降序排列。
 
-## submitted_date
+## submitted_date 与归档边界
 
 使用 Atom `<updated>` 的 UTC 日期作为 `submitted_date`，对应 arXiv Advanced Search 中“Submission date (most recent)”的语义。
 
-从新到旧找到第一篇尚未存在于飞书表格的论文，以其 UTC 日期为本批 `submitted_date`。继续读取，直到已完整覆盖该日期，再保留该日所有未归档论文。
+按 `lastUpdatedDate` 降序读取结果。第一篇通过查询条件和分类模式检查的论文确定 arXiv 最近 `submitted_date`，已有链接不参与这个日期的确定。
+
+表格归档状态按以下规则决定是否处理该日：
+
+- 表格没有记录：处理 arXiv 最近 `submitted_date`；
+- 表格有记录且 arXiv 最近 `submitted_date` 严格晚于表格 `latest_date`：处理 arXiv 最近 `submitted_date`；
+- arXiv 最近 `submitted_date` 等于或早于表格 `latest_date`：返回无新论文。
+
+确定目标日后，继续读取直到完整覆盖该日期，只保留该日满足筛选条件且链接尚未存在的论文。目标日去重后为空时返回无新论文，不读取相同或更早日期作为替代批次。
 
 ## 分类
 

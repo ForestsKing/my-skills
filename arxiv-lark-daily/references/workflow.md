@@ -5,7 +5,7 @@
 运行产物保存在当前目录的 `.arxiv-lark-daily/`：
 
 - `base.json`：Base、数据表、默认 View、字段标识、Base 链接和已有标签选项；
-- `existing-links.json`：已归档论文的规范化 abs URL；
+- `archive-state.json`：表格实际记录数、最大有效日期和已归档论文的规范化 abs URL；
 - `papers.json`：本批 `submitted_date` 的论文及处理状态；
 - `write-manifest.json`：记录创建进度，用于中断恢复。
 
@@ -35,7 +35,7 @@
 }
 ```
 
-飞书去重使用不含版本号的规范化 abs URL。标题不能作为去重键。
+表格实际记录数用于判断空表，最大有效日期用于确定归档边界。飞书链接集合只在目标日内去重，使用不含版本号的规范化 abs URL；标题不能作为去重键。
 
 ## enrichment 文件
 
