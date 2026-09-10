@@ -25,7 +25,7 @@ from common import (
     save_json,
     walk_values,
 )
-from run_pipeline import validate_tags
+from run_pipeline import validate_keywords
 
 
 ID_KEY_ALIASES = {
@@ -163,11 +163,6 @@ def is_multiple_select(item: dict[str, Any]) -> bool:
     return item.get("multiple") is True or prop.get("multiple") is True
 
 
-def is_static_select(item: dict[str, Any]) -> bool:
-    prop = item.get("property") if isinstance(item.get("property"), dict) else {}
-    return "dynamic_options_source" not in item and "dynamic_options_source" not in prop
-
-
 def field_options(item: dict[str, Any]) -> list[Any]:
     prop = item.get("property") if isinstance(item.get("property"), dict) else {}
     options = item.get("options") if isinstance(item.get("options"), list) else prop.get("options")
@@ -246,8 +241,6 @@ def validate_remote_fields(payload: Any, expected_fields: list[dict[str, Any]]) 
         actual = by_name[expected["name"]]
         if field_type(actual) != expected["type"]:
             raise SkillError(f"字段“{expected['name']}”类型不符合契约。期望 {expected['type']}，实际 {field_type(actual)}")
-    if not is_multiple_select(by_name["标签"]) or not is_static_select(by_name["标签"]):
-        raise SkillError("现有“标签”字段不是静态多选字段")
     link_style = field_style(by_name["链接"])
     date_style = field_style(by_name["日期"])
     if link_style.get("type") != "url":
@@ -361,7 +354,6 @@ def prepare(config: dict[str, Any]) -> dict[str, Any]:
         fields_payload = field_list(base_token, table_id, config)
         field_ids = validate_remote_fields(fields_payload, config["fields"])
     view_id, view_order_applied = order_default_view(base_token, table_id, config)
-    tag_field = next(item for item in remote_fields(fields_payload) if field_name(item) == "标签")
     return {
         "base_token": base_token,
         "table_id": table_id,
@@ -371,7 +363,6 @@ def prepare(config: dict[str, Any]) -> dict[str, Any]:
         "base_name": config["destination"]["base_name"],
         "table_name": config["destination"]["table_name"],
         "field_ids": field_ids,
-        "tag_options": [name for name in (option_name(option) for option in field_options(tag_field)) if name],
     }
 
 
@@ -617,47 +608,6 @@ def find_existing_record(config: dict[str, Any], base_state: dict[str, Any], lin
     return matches[0] if matches else ""
 
 
-def tag_field_definition(config: dict[str, Any], base_state: dict[str, Any]) -> dict[str, Any]:
-    fields_payload = field_list(base_state["base_token"], base_state["table_id"], config)
-    for item in remote_fields(fields_payload):
-        if field_name(item) == "标签":
-            return item
-    raise SkillError("未找到“标签”字段")
-
-
-def option_from_name(name: str) -> dict[str, str]:
-    return {"name": name}
-
-
-def ensure_tag_options(config: dict[str, Any], base_state: dict[str, Any], papers: list[dict[str, Any]]) -> dict[str, Any]:
-    requested: list[str] = []
-    seen = set()
-    for paper in papers:
-        tags = validate_tags(paper.get("tags"), paper)
-        paper["tags"] = tags
-        for tag in tags:
-            if tag not in seen:
-                requested.append(tag)
-                seen.add(tag)
-    field = tag_field_definition(config, base_state)
-    options = field_options(field)
-    existing_names = [name for name in (option_name(option) for option in options) if name]
-    missing = [tag for tag in requested if tag not in set(existing_names)]
-    if not missing:
-        base_state["tag_options"] = existing_names
-        return base_state
-    new_options = clean_options(options) + [option_from_name(tag) for tag in missing]
-    new_definition = {"type": "select", "name": "标签", "multiple": True, "options": new_options}
-    update_field(base_state["base_token"], base_state["table_id"], field_id(field), new_definition, config)
-    refreshed = tag_field_definition(config, base_state)
-    refreshed_names = [name for name in (option_name(option) for option in field_options(refreshed)) if name]
-    still_missing = [tag for tag in requested if tag not in set(refreshed_names)]
-    if still_missing:
-        raise SkillError("标签选项更新后仍缺少: " + "、".join(still_missing))
-    base_state["tag_options"] = refreshed_names
-    return base_state
-
-
 def created_record_ids(payload: Any) -> list[str]:
     body = response_body(payload)
     ids: list[str] = []
@@ -688,11 +638,11 @@ def create_record(config: dict[str, Any], base_state: dict[str, Any], paper: dic
     if not submitted_date:
         raise SkillError(f"论文缺少 submitted_date: {paper['canonical_id']}")
     parse_iso_date(submitted_date)
-    fields = ["标题", "摘要", "标签", "日期", "链接"]
+    fields = ["标题", "摘要", "关键词", "日期", "链接"]
     row = [
         paper["title"],
         paper["abstract_zh"],
-        paper["tags"],
+        "、".join(paper["keywords"]),
         submitted_date + "T00:00:00Z",
         markdown_abs_link(paper["abs_url"]),
     ]
@@ -714,14 +664,13 @@ def write_papers(config: dict[str, Any], base_state: dict[str, Any], state: dict
     papers = state.get("papers", [])
     if state.get("submitted_date"):
         prune_manifest_file(manifest_path, state["submitted_date"], config["retention_days"])
-    base_state = ensure_tag_options(config, base_state, papers)
     manifest = load_json(manifest_path) if manifest_path.exists() else {"papers": {}}
     completed = manifest.setdefault("papers", {})
     written_count = 0
     for paper in papers:
         if not paper.get("abstract_zh"):
             raise SkillError(f"缺少中文摘要，停止写入: {paper['canonical_id']}")
-        validate_tags(paper.get("tags"), paper)
+        paper["keywords"] = validate_keywords(paper.get("keywords"), paper)
         progress = completed.setdefault(paper["canonical_id"], {"submitted_date": paper.get("submitted_date", "")})
         record_id = find_existing_record(config, base_state, paper["abs_url"])
         if not record_id:
@@ -758,7 +707,7 @@ def main() -> int:
         if args.command == "prepare":
             state = prepare(config)
             save_json(args.output, state)
-            result = {"ok": True, "output": args.output, "base_name": state["base_name"], "table_name": state["table_name"], "base_url": state["base_url"], "tag_options": state.get("tag_options", [])}
+            result = {"ok": True, "output": args.output, "base_name": state["base_name"], "table_name": state["table_name"], "base_url": state["base_url"]}
         elif args.command == "export-state":
             state = export_state(config, load_json(args.base_state))
             save_json(args.output, state)

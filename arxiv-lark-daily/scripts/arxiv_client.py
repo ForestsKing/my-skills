@@ -133,7 +133,7 @@ def parse_feed(xml_bytes: bytes) -> FeedPage:
             "authors": [normalize_space(author.findtext(f"{{{ATOM}}}name")) for author in node.findall(f"{{{ATOM}}}author")],
             "primary_category": primary.attrib.get("term", "") if primary is not None else "",
             "categories": [item.attrib.get("term", "") for item in node.findall(f"{{{ATOM}}}category")],
-            "tags": [],
+            "keywords": [],
             "record_id": "",
             "errors": [],
         })

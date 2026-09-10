@@ -20,7 +20,7 @@ class SkillError(RuntimeError):
 FIELDS = [
     {"name": "标题", "type": "text"},
     {"name": "摘要", "type": "text"},
-    {"name": "标签", "type": "select", "multiple": True, "options": []},
+    {"name": "关键词", "type": "text"},
     {"name": "日期", "type": "datetime", "style": {"format": "yyyy-MM-dd"}},
     {"name": "链接", "type": "text", "style": {"type": "url"}},
 ]
