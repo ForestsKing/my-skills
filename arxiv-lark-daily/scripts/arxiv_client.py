@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import html.parser
+import http.client
 import json
 import re
 import sys
@@ -38,6 +40,187 @@ class FeedPage:
     total_results: int
     start_index: int
     items_per_page: int
+
+
+@dataclass
+class WebSearchPage:
+    entries: list[dict[str, Any]]
+    total_results: int
+
+
+class ArxivTransportError(SkillError):
+    pass
+
+
+class SearchHtmlParser(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.entries: list[dict[str, Any]] = []
+        self.page_text: list[str] = []
+        self.current: dict[str, Any] | None = None
+        self.title_active = False
+        self.authors_active = False
+        self.author_active = False
+        self.abstract_active = False
+        self.abstract_link_active = False
+        self.date_active = False
+        self.tags_active = False
+        self.category_active = False
+        self.category_primary = False
+
+    @staticmethod
+    def _classes(attrs: dict[str, str | None]) -> set[str]:
+        return set((attrs.get("class") or "").split())
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        attrs = dict(attrs_list)
+        classes = self._classes(attrs)
+        if tag == "li" and "arxiv-result" in classes:
+            self.current = {
+                "canonical_id": "",
+                "title_parts": [],
+                "authors": [],
+                "author_parts": [],
+                "abstract_parts": [],
+                "date_parts": [],
+                "categories": [],
+                "primary_category": "",
+                "category_parts": [],
+            }
+            return
+        if self.current is None:
+            return
+        if tag == "a":
+            href = attrs.get("href") or ""
+            match = re.search(r"/abs/([^?#]+)", href)
+            if match and not self.current["canonical_id"]:
+                self.current["canonical_id"] = normalize_id(match.group(1))[0]
+            if self.authors_active and "searchtype=author" in href:
+                self.author_active = True
+                self.current["author_parts"] = []
+            if self.abstract_active:
+                self.abstract_link_active = True
+        elif tag == "p":
+            if "title" in classes:
+                self.title_active = True
+            elif "authors" in classes:
+                self.authors_active = True
+            elif "is-size-7" in classes:
+                self.date_active = True
+        elif tag == "span" and "abstract-full" in classes:
+            self.abstract_active = True
+        elif tag == "div" and "tags" in classes:
+            self.tags_active = True
+        elif tag == "span" and self.tags_active and "tag" in classes:
+            self.category_active = True
+            self.category_primary = "is-link" in classes
+            self.current["category_parts"] = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.current is None:
+            return
+        if tag == "a":
+            if self.author_active:
+                author = normalize_space("".join(self.current["author_parts"]))
+                if author:
+                    self.current["authors"].append(author)
+                self.author_active = False
+            if self.abstract_link_active:
+                self.abstract_link_active = False
+        elif tag == "p":
+            self.title_active = False
+            self.authors_active = False
+            self.date_active = False
+        elif tag == "span":
+            if self.category_active:
+                category = normalize_space("".join(self.current["category_parts"]))
+                if category:
+                    self.current["categories"].append(category)
+                    if self.category_primary:
+                        self.current["primary_category"] = category
+                self.category_active = False
+                self.category_primary = False
+            elif self.abstract_active and not self.abstract_link_active:
+                self.abstract_active = False
+        elif tag == "div" and self.tags_active:
+            self.tags_active = False
+        elif tag == "li":
+            self._finish_result()
+
+    def handle_data(self, data: str) -> None:
+        self.page_text.append(data)
+        if self.current is None:
+            return
+        if self.title_active:
+            self.current["title_parts"].append(data)
+        if self.author_active:
+            self.current["author_parts"].append(data)
+        if self.abstract_active and not self.abstract_link_active:
+            self.current["abstract_parts"].append(data)
+        if self.date_active:
+            self.current["date_parts"].append(data)
+        if self.category_active:
+            self.current["category_parts"].append(data)
+
+    def _finish_result(self) -> None:
+        if self.current is None:
+            return
+        date_text = normalize_space("".join(self.current["date_parts"]))
+        match = re.search(r"Submitted\s+(\d{1,2}\s+[A-Za-z]+,\s+\d{4})", date_text)
+        if self.current["canonical_id"] and match:
+            submitted = datetime.strptime(match.group(1), "%d %B, %Y").date().isoformat()
+            self.entries.append({
+                "canonical_id": self.current["canonical_id"],
+                "title": normalize_space("".join(self.current["title_parts"])),
+                "authors": self.current["authors"],
+                "abstract_en": normalize_space("".join(self.current["abstract_parts"])),
+                "submitted_date": submitted,
+                "primary_category": self.current["primary_category"],
+                "categories": self.current["categories"],
+            })
+        self.current = None
+        self.title_active = False
+        self.authors_active = False
+        self.author_active = False
+        self.abstract_active = False
+        self.abstract_link_active = False
+        self.date_active = False
+        self.tags_active = False
+        self.category_active = False
+
+
+class AbsHtmlParser(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.metadata: dict[str, list[str]] = {}
+        self.submission_active = False
+        self.submission_div_depth = 0
+        self.submission_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        attrs = dict(attrs_list)
+        if tag == "meta":
+            name = attrs.get("name") or ""
+            content = attrs.get("content") or ""
+            if name.startswith("citation_") and content:
+                self.metadata.setdefault(name, []).append(content)
+        if tag == "div":
+            classes = set((attrs.get("class") or "").split())
+            if self.submission_active:
+                self.submission_div_depth += 1
+            elif "submission-history" in classes:
+                self.submission_active = True
+                self.submission_div_depth = 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "div" and self.submission_active:
+            self.submission_div_depth -= 1
+            if self.submission_div_depth == 0:
+                self.submission_active = False
+
+    def handle_data(self, data: str) -> None:
+        if self.submission_active:
+            self.submission_parts.append(data)
 
 
 def normalize_space(text: str | None) -> str:
@@ -150,6 +333,136 @@ def parse_feed(xml_bytes: bytes) -> FeedPage:
     )
 
 
+def parse_web_search(xml_bytes: bytes) -> WebSearchPage:
+    parser = SearchHtmlParser()
+    try:
+        parser.feed(xml_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise SkillError(f"arXiv 搜索网页解析失败: {exc}") from exc
+    page_text = normalize_space("".join(parser.page_text))
+    total_match = re.search(r"Showing\s+[\d,]+[–-][\d,]+\s+of\s+([\d,]+)\s+results", page_text)
+    if not total_match:
+        no_results = "Sorry, your query for" in page_text and "produced no results" in page_text
+        if no_results:
+            return WebSearchPage(entries=[], total_results=0)
+        raise SkillError("arXiv 搜索网页缺少结果总数")
+    return WebSearchPage(entries=parser.entries, total_results=int(total_match.group(1).replace(",", "")))
+
+
+def parse_abs_page(xml_bytes: bytes, search_entry: dict[str, Any]) -> dict[str, Any]:
+    parser = AbsHtmlParser()
+    try:
+        parser.feed(xml_bytes.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise SkillError(f"arXiv 摘要网页解析失败: {exc}") from exc
+    metadata = parser.metadata
+    canonical_id, _ = normalize_id((metadata.get("citation_arxiv_id") or [search_entry["canonical_id"]])[0])
+    if canonical_id != search_entry["canonical_id"]:
+        raise SkillError(f"arXiv 摘要网页 ID 不一致: 期望 {search_entry['canonical_id']}，得到 {canonical_id}")
+    history = normalize_space("".join(parser.submission_parts))
+    versions = re.findall(
+        r"\[v(\d+)\]\s*([A-Z][a-z]{2},\s+\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s+UTC)",
+        history,
+    )
+    if not versions:
+        raise SkillError(f"arXiv 摘要网页缺少提交历史: {canonical_id}")
+    parsed_versions = [
+        (int(version), datetime.strptime(value, "%a, %d %b %Y %H:%M:%S UTC").replace(tzinfo=timezone.utc))
+        for version, value in versions
+    ]
+    version, updated_at = parsed_versions[-1]
+    published_at = parsed_versions[0][1]
+    if updated_at.date().isoformat() != search_entry["submitted_date"]:
+        raise SkillError(
+            f"arXiv 搜索页与摘要页日期不一致: {canonical_id}，"
+            f"搜索页 {search_entry['submitted_date']}，摘要页 {updated_at.date().isoformat()}"
+        )
+    title = normalize_space((metadata.get("citation_title") or [search_entry["title"]])[0])
+    abstract = normalize_space((metadata.get("citation_abstract") or [search_entry["abstract_en"]])[0])
+    return {
+        "canonical_id": canonical_id,
+        "version": version,
+        "title": title,
+        "abstract_en": abstract,
+        "abstract_zh": "",
+        "published": published_at.isoformat().replace("+00:00", "Z"),
+        "updated": updated_at.isoformat().replace("+00:00", "Z"),
+        "submitted_date": updated_at.date().isoformat(),
+        "abs_url": f"https://arxiv.org/abs/{canonical_id}",
+        "authors": search_entry["authors"] or metadata.get("citation_author", []),
+        "primary_category": search_entry["primary_category"],
+        "categories": search_entry["categories"],
+        "keywords": [],
+        "record_id": "",
+        "errors": [],
+    }
+
+
+def build_web_query(config: dict[str, Any]) -> tuple[str, str]:
+    terms = config.get("terms", [])
+    if not terms:
+        raise SkillError("至少需要一个非空 arXiv 搜索词")
+    fields = {item.get("field", "all") for item in terms}
+    if len(fields) != 1:
+        raise SkillError("搜索网页备用通道要求所有检索词使用同一个字段")
+    field = fields.pop()
+    search_types = {
+        "all": "all",
+        "title": "title",
+        "author": "author",
+        "abstract": "abstract",
+        "comment": "comments",
+        "journal_reference": "journal_ref",
+        "report_number": "report_num",
+        "category": "all",
+    }
+    if field not in search_types:
+        raise SkillError(f"搜索网页备用通道不支持字段: {field}")
+    parts: list[str] = []
+    for index, item in enumerate(terms):
+        term = normalize_space(item.get("term"))
+        if not term:
+            continue
+        operator = str(item.get("operator", "AND")).upper()
+        if index:
+            parts.append(operator)
+        parts.append(quote_term(term))
+    return " ".join(parts), search_types[field]
+
+
+def paper_matches_web_filters(paper: dict[str, Any], config: dict[str, Any]) -> bool:
+    configured = config.get("categories", [])
+    if configured:
+        if config.get("include_cross_list", True):
+            if not any(category_matches(value, configured) for value in paper.get("categories", [])):
+                return False
+        elif not category_matches(paper.get("primary_category", ""), configured):
+            return False
+    values = {
+        "title": paper.get("title", ""),
+        "author": " ".join(paper.get("authors", [])),
+        "abstract": paper.get("abstract_en", ""),
+        "category": " ".join(paper.get("categories", [])),
+    }
+    values["all"] = " ".join(values.values())
+    result: bool | None = None
+    for item in config.get("terms", []):
+        field = item.get("field", "all")
+        if field not in values:
+            return True
+        matched = normalize_space(item.get("term")).casefold() in values[field].casefold()
+        operator = str(item.get("operator", "AND")).upper()
+        if result is None:
+            result = matched
+        elif operator == "OR":
+            result = result or matched
+        elif operator == "NOT":
+            result = result and not matched
+        else:
+            result = result and matched
+    return bool(result)
+
+
 class ArxivClient:
     def __init__(self, config: dict[str, Any], opener: Callable[[urllib.request.Request, float], bytes] | None = None, sleeper: Callable[[float], None] = time.sleep):
         self.config = config
@@ -177,24 +490,26 @@ class ArxivClient:
             self.config.get("api_url", "https://export.arxiv.org/api/query") + "?" + params,
             headers={"User-Agent": self.config.get("user_agent", "arxiv-lark-daily/1.0")},
         )
-        retries = int(self.config.get("max_retries", 3))
-        timeout = float(self.config.get("timeout_seconds", 45))
+        retries = int(self.config.get("atom_max_retries", 1))
+        timeout = float(self.config.get("atom_timeout_seconds", 15))
         for attempt in range(retries + 1):
             try:
                 self.last_request_at = time.monotonic()
                 return parse_feed(self.opener(request, timeout))
             except urllib.error.HTTPError as exc:
-                if exc.code not in {429, 500, 502, 503, 504} or attempt >= retries:
+                if exc.code not in {429, 500, 502, 503, 504}:
                     raise SkillError(f"arXiv HTTP 错误: {exc.code}") from exc
+                if attempt >= retries:
+                    raise ArxivTransportError(f"arXiv HTTP 错误: {exc.code}") from exc
                 retry_after = exc.headers.get("Retry-After") if exc.headers else None
                 self.sleeper(max(interval, float(retry_after or 0)))
-            except (urllib.error.URLError, TimeoutError) as exc:
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
                 if attempt >= retries:
-                    raise SkillError(f"arXiv 网络请求失败: {exc}") from exc
+                    raise ArxivTransportError(f"arXiv 网络请求失败: {exc}") from exc
                 self.sleeper(interval)
-        raise SkillError("arXiv 请求重试耗尽")
+        raise ArxivTransportError("arXiv 请求重试耗尽")
 
-    def fetch_latest_day(self, existing_links: set[str], latest_date: str = "") -> dict[str, Any]:
+    def _fetch_latest_day_atom(self, existing_links: set[str], latest_date: str = "") -> dict[str, Any]:
         query = build_search_query(self.config)
         latest_archived = parse_iso_date(latest_date) if latest_date else None
         page_size = int(self.config.get("page_size", 200))
@@ -256,6 +571,122 @@ class ArxivClient:
             if start >= page.total_results or len(page.entries) < page_size:
                 break
         return result()
+
+    def _request_web_bytes(self, request: urllib.request.Request, label: str) -> bytes:
+        interval = max(3.0, float(self.config.get("request_interval_seconds", 3.0)))
+        retries = int(self.config.get("max_retries", 3))
+        timeout = float(self.config.get("timeout_seconds", 45))
+        for attempt in range(retries + 1):
+            elapsed = time.monotonic() - self.last_request_at
+            if self.last_request_at and elapsed < interval:
+                self.sleeper(interval - elapsed)
+            try:
+                self.last_request_at = time.monotonic()
+                return self.opener(request, timeout)
+            except urllib.error.HTTPError as exc:
+                if exc.code not in {429, 500, 502, 503, 504} or attempt >= retries:
+                    raise SkillError(f"arXiv {label} HTTP 错误: {exc.code}") from exc
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                self.sleeper(max(interval, float(retry_after or 0)))
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+                if attempt >= retries:
+                    raise SkillError(f"arXiv {label}请求失败: {exc}") from exc
+                self.sleeper(interval)
+        raise SkillError(f"arXiv {label}请求重试耗尽")
+
+    def _request_web_search(self, start: int) -> WebSearchPage:
+        query, search_type = build_web_query(self.config)
+        params = urllib.parse.urlencode({
+            "query": query,
+            "searchtype": search_type,
+            "abstracts": "show",
+            "order": "-submitted_date",
+            "size": min(200, int(self.config.get("page_size", 200))),
+            "start": start,
+        })
+        request = urllib.request.Request(
+            self.config.get("web_search_url", "https://arxiv.org/search/") + "?" + params,
+            headers={"User-Agent": self.config.get("user_agent", "arxiv-lark-daily/1.0")},
+        )
+        return parse_web_search(self._request_web_bytes(request, "搜索网页"))
+
+    def _request_abs_page(self, paper: dict[str, Any]) -> dict[str, Any]:
+        request = urllib.request.Request(
+            f"https://arxiv.org/abs/{paper['canonical_id']}",
+            headers={"User-Agent": self.config.get("user_agent", "arxiv-lark-daily/1.0")},
+        )
+        return parse_abs_page(self._request_web_bytes(request, "摘要网页"), paper)
+
+    def _fetch_latest_day_web(self, existing_links: set[str], latest_date: str = "") -> dict[str, Any]:
+        query = build_search_query(self.config)
+        latest_archived = parse_iso_date(latest_date) if latest_date else None
+        page_size = min(200, int(self.config.get("page_size", 200)))
+        cap = int(self.config.get("max_accessible_results", 30000))
+        start = 0
+        submitted_date = ""
+        selected: dict[str, dict[str, Any]] = {}
+        observed: set[str] = set()
+        total_results: int | None = None
+
+        def result(papers: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+            items = papers or []
+            return {
+                "status": "ok" if items else "no_new_papers",
+                "date_semantics": "submitted_date_from_atom_updated_utc",
+                "submitted_date": submitted_date,
+                "filter_summary": query,
+                "query": query,
+                "total_results": total_results or 0,
+                "papers": items,
+                "stats": {"discovered_count": len(items), "written_count": 0, "failure_count": 0},
+            }
+
+        while True:
+            if start >= cap:
+                raise SkillError("网页备用通道需要访问超过 30,000 条结果，请缩小筛选条件")
+            page = self._request_web_search(start)
+            if total_results is None:
+                total_results = page.total_results
+            elif page.total_results != total_results:
+                raise SkillError(f"arXiv 搜索网页结果总数跨页不一致: 首页 {total_results}，当前 {page.total_results}")
+            if not page.entries:
+                if start < (total_results or 0):
+                    raise SkillError(f"arXiv 搜索网页在 start={start} 没有可解析结果")
+                break
+            stop_after_page = False
+            for paper in page.entries:
+                if not paper_matches_web_filters(paper, self.config):
+                    continue
+                day = paper["submitted_date"]
+                if submitted_date and day < submitted_date:
+                    stop_after_page = True
+                    break
+                if not submitted_date:
+                    submitted_date = day
+                    if latest_archived and parse_iso_date(day) <= latest_archived:
+                        return result()
+                canonical = paper["canonical_id"]
+                if canonical in observed:
+                    continue
+                observed.add(canonical)
+                abs_url = f"https://arxiv.org/abs/{canonical}"
+                if day == submitted_date and abs_url not in existing_links:
+                    selected[canonical] = paper
+            if stop_after_page:
+                break
+            start += len(page.entries)
+            if start >= (total_results or 0) or len(page.entries) < page_size:
+                break
+        papers = [self._request_abs_page(paper) for paper in selected.values()]
+        papers.sort(key=lambda item: (item["updated"], item["canonical_id"]), reverse=True)
+        return result(papers)
+
+    def fetch_latest_day(self, existing_links: set[str], latest_date: str = "") -> dict[str, Any]:
+        try:
+            return self._fetch_latest_day_atom(existing_links, latest_date)
+        except ArxivTransportError as exc:
+            print(f"Atom API 不可用，改用 arXiv 搜索网页: {exc}", file=sys.stderr)
+            return self._fetch_latest_day_web(existing_links, latest_date)
 
 
 def normalize_existing_links(items: list[Any]) -> set[str]:
